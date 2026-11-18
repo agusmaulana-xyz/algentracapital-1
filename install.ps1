@@ -318,6 +318,8 @@ function Install-Service($name,$app,$appArgs,$workingDir,$logDir) {
   $serviceSid=Get-ServiceSid $name
   & icacls $InstallDir /grant ('*'+$serviceSid+':(OI)(CI)M') /T /C | Out-Null
   if($LASTEXITCODE -ne 0){throw "Gagal memberi izin folder instalasi kepada service $name."}
+  & icacls $Nssm /grant ('*'+$serviceSid+':(RX)') | Out-Null
+  if($LASTEXITCODE -ne 0){throw "Gagal memberi izin menjalankan NSSM kepada service $name."}
 }
 function Register-AlgentraTasks {
   $v=Read-Env
