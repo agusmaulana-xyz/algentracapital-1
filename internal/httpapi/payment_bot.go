@@ -13,6 +13,7 @@ import (
 	"fmt"
 	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -31,11 +33,15 @@ type telegramPaymentBot struct {
 	pricing       ServicePricing
 	projectRoot   string
 	client        *http.Client
+	mu            sync.Mutex
+	notifying     map[int64]struct{}
+	retryCursor   int64
 }
 
 type telegramEnvelope struct {
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result"`
+	OK          bool            `json:"ok"`
+	Description string          `json:"description"`
+	Result      json.RawMessage `json:"result"`
 }
 type telegramUpdate struct {
 	UpdateID int64             `json:"update_id"`
@@ -55,6 +61,8 @@ type telegramMessage struct {
 }
 
 func (bot *telegramPaymentBot) httpClient() *http.Client {
+	bot.mu.Lock()
+	defer bot.mu.Unlock()
 	if bot.client == nil {
 		bot.client = &http.Client{Timeout: 45 * time.Second}
 	}
@@ -87,15 +95,36 @@ func (bot *telegramPaymentBot) call(ctx context.Context, method string, values u
 
 func (bot *telegramPaymentBot) notifyOrder(ctx context.Context, orderID int64) bool {
 	if bot == nil || bot.token == "" || bot.chatID == "" {
+		slog.Warn("payment admin notification unavailable", "order_id", orderID, "stage", "telegram_not_configured")
 		return false
 	}
+	bot.mu.Lock()
+	if bot.notifying == nil {
+		bot.notifying = make(map[int64]struct{})
+	}
+	if _, busy := bot.notifying[orderID]; busy {
+		bot.mu.Unlock()
+		return false
+	}
+	bot.notifying[orderID] = struct{}{}
+	bot.mu.Unlock()
+	defer func() {
+		bot.mu.Lock()
+		delete(bot.notifying, orderID)
+		bot.mu.Unlock()
+	}()
+
 	var email, label, server, login, plan string
 	var amount int64
 	var proof sql.NullString
 	var status string
 	var notified sql.NullTime
 	err := bot.pool.QueryRow(ctx, `SELECT email,label,server,login,plan,total_idr,proof_filename,status,admin_notified_at FROM payment_orders WHERE id=$1`, orderID).Scan(&email, &label, &server, &login, &plan, &amount, &proof, &status, &notified)
-	if err != nil || status != "PAYMENT_SUBMITTED" || !proof.Valid {
+	if err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "order_lookup", "error_type", fmt.Sprintf("%T", err))
+		return false
+	}
+	if status != "PAYMENT_SUBMITTED" || !proof.Valid {
 		return false
 	}
 	if notified.Valid {
@@ -103,6 +132,7 @@ func (bot *telegramPaymentBot) notifyOrder(ctx context.Context, orderID int64) b
 	}
 	name := filepath.Base(proof.String)
 	if name != proof.String {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "invalid_proof_filename")
 		return false
 	}
 	root := bot.projectRoot
@@ -116,20 +146,35 @@ func (bot *telegramPaymentBot) notifyOrder(ctx context.Context, orderID int64) b
 	path := filepath.Join(root, "backend", "data", "payment_proofs", name)
 	file, err := os.Open(path)
 	if err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "proof_file_open", "error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "proof_file_stat", "error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	_ = writer.WriteField("chat_id", bot.chatID)
+	if err := writer.WriteField("chat_id", bot.chatID); err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "multipart_chat_field")
+		return false
+	}
 	caption := fmt.Sprintf("Pembayaran pesanan #%d\nClient: %s\nAkun: %s · %s · %s\nPaket: %s\nTotal: %s\n\nPeriksa bukti transfer, lalu pilih keputusan di bawah.", orderID, email, label, login, server, plan, formatRupiah(amount))
-	_ = writer.WriteField("caption", caption)
-	keyboard, _ := json.Marshal(map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "Transaksi diterima", "callback_data": fmt.Sprintf("pay:accept:%d", orderID)}, {"text": "Transaksi tidak valid", "callback_data": fmt.Sprintf("pay:invalid:%d", orderID)}}}})
-	_ = writer.WriteField("reply_markup", string(keyboard))
+	if err := writer.WriteField("caption", caption); err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "multipart_caption")
+		return false
+	}
+	keyboard, err := json.Marshal(map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "Transaksi diterima", "callback_data": fmt.Sprintf("pay:accept:%d", orderID)}, {"text": "Transaksi tidak valid", "callback_data": fmt.Sprintf("pay:invalid:%d", orderID)}}}})
+	if err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "keyboard_encode", "error_type", fmt.Sprintf("%T", err))
+		return false
+	}
+	if err := writer.WriteField("reply_markup", string(keyboard)); err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "multipart_keyboard")
+		return false
+	}
 	photoHeader := make(textproto.MIMEHeader)
 	photoHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="photo"; filename="%s"`, info.Name()))
 	photoType := map[string]string{".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}[strings.ToLower(filepath.Ext(info.Name()))]
@@ -139,33 +184,105 @@ func (bot *telegramPaymentBot) notifyOrder(ctx context.Context, orderID int64) b
 	photoHeader.Set("Content-Type", photoType)
 	part, err := writer.CreatePart(photoHeader)
 	if err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "multipart_photo")
 		return false
 	}
 	if _, err = io.Copy(part, file); err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "proof_read", "error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	if err = writer.Close(); err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "multipart_close")
 		return false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, bot.endpoint("sendPhoto"), &body)
 	if err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "telegram_request", "error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	resp, err := bot.httpClient().Do(req)
 	if err != nil {
+		// Do not log err text: url.Error includes the bot token embedded in the API URL.
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "telegram_transport", "error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	defer resp.Body.Close()
 	var envelope telegramEnvelope
-	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope) != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || !envelope.OK {
+	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope)
+	if decodeErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 || !envelope.OK {
+		attrs := []any{"order_id", orderID, "stage", "telegram_send_photo", "http_status", resp.StatusCode}
+		if decodeErr != nil {
+			attrs = append(attrs, "error_type", fmt.Sprintf("%T", decodeErr))
+		} else if envelope.Description != "" {
+			attrs = append(attrs, "telegram_description", truncateRunes(envelope.Description, 200))
+		}
+		slog.Warn("payment admin notification failed", attrs...)
 		return false
 	}
 	_, err = bot.pool.Exec(ctx, `UPDATE payment_orders SET admin_notified_at=$2,updated_at=$2 WHERE id=$1 AND status='PAYMENT_SUBMITTED' AND admin_notified_at IS NULL`, orderID, time.Now().UTC())
 	if err != nil {
+		slog.Warn("payment admin notification failed", "order_id", orderID, "stage", "mark_notified", "error_type", fmt.Sprintf("%T", err))
 		return false
 	}
 	return true
+}
+
+func (bot *telegramPaymentBot) retryPendingNotifications(ctx context.Context) {
+	bot.retryPendingNotificationsOnce(ctx)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			bot.retryPendingNotificationsOnce(ctx)
+		}
+	}
+}
+
+func (bot *telegramPaymentBot) retryPendingNotificationsOnce(parent context.Context) {
+	bot.mu.Lock()
+	cursor := bot.retryCursor
+	bot.mu.Unlock()
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	rows, err := bot.pool.Query(ctx, `SELECT id FROM payment_orders WHERE id>$1 AND status='PAYMENT_SUBMITTED' AND proof_filename IS NOT NULL AND admin_notified_at IS NULL ORDER BY id LIMIT 5`, cursor)
+	if err != nil {
+		cancel()
+		slog.Warn("payment notification retry scan failed", "error_type", fmt.Sprintf("%T", err))
+		return
+	}
+	ids := make([]int64, 0, 5)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			cancel()
+			slog.Warn("payment notification retry scan failed", "error_type", fmt.Sprintf("%T", err))
+			return
+		}
+		ids = append(ids, id)
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+	cancel()
+	if rowsErr != nil {
+		slog.Warn("payment notification retry scan failed", "error_type", fmt.Sprintf("%T", rowsErr))
+		return
+	}
+	bot.mu.Lock()
+	if len(ids) == 0 {
+		bot.retryCursor = 0
+	} else {
+		bot.retryCursor = ids[len(ids)-1]
+	}
+	bot.mu.Unlock()
+	for _, id := range ids {
+		attemptCtx, attemptCancel := context.WithTimeout(parent, 20*time.Second)
+		bot.notifyOrder(attemptCtx, id)
+		attemptCancel()
+	}
 }
 
 func formatRupiah(value int64) string {
@@ -215,7 +332,7 @@ func (api paymentAPI) retryNotification(w http.ResponseWriter, r *http.Request) 
 	}
 	notifyCtx, notifyCancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer notifyCancel()
-	sent := api.bot != nil && api.bot.notifyOrder(notifyCtx, id)
+	sent := api.bot.notifyOrder(notifyCtx, id)
 	writeJSON(w, 200, map[string]bool{"notification_sent": sent})
 }
 

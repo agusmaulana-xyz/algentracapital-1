@@ -193,12 +193,9 @@ func (api paymentAPI) submitProof(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "Bukti pembayaran tidak dapat disimpan")
 		return
 	}
-	notificationSent := false
-	if api.bot != nil {
-		notifyCtx, notifyCancel := context.WithTimeout(r.Context(), 45*time.Second)
-		notificationSent = api.bot.notifyOrder(notifyCtx, id)
-		notifyCancel()
-	}
+	notifyCtx, notifyCancel := context.WithTimeout(r.Context(), 45*time.Second)
+	notificationSent := api.bot.notifyOrder(notifyCtx, id)
+	notifyCancel()
 	order["notification_sent"] = notificationSent
 	writeJSON(w, 200, order)
 }

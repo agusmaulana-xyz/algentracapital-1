@@ -128,6 +128,7 @@ func NewHandler(pool *dbstore.Pool, cfg ServerConfig) http.Handler {
 			botCtx = context.Background()
 		}
 		go payments.bot.run(botCtx)
+		go payments.bot.retryPendingNotifications(botCtx)
 	}
 	payments.register(mux)
 	settingsAPI{pool: pool, appEnv: cfg.Environment, eaAPIKey: cfg.EAAPIKey, geminiAPIKey: cfg.GeminiAPIKey, geminiModel: cfg.GeminiModel}.register(mux)
