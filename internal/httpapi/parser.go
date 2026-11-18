@@ -385,7 +385,11 @@ func fallbackClassification(message string) signalClassification {
 	if !regexp.MustCompile(`(?i)\b(NOW|LIMIT|STOP|ENTRY|BUY|SELL|LONG|SHORT|BELI|JUAL)\b`).MatchString(t) {
 		return notSignal("Tidak ditemukan kata pemicu sinyal yang jelas")
 	}
-	return signalClassification{true, "NEW_SIGNAL", &a, &order, symbol, entry, low, high, tp, sl, .76, "Dikenali oleh parser regex fallback; verifikasi manual disarankan"}
+	return signalClassification{
+		IsSignal: true, Type: "NEW_SIGNAL", Action: &a, OrderType: &order, Symbol: symbol,
+		Entry: entry, EntryLow: low, EntryHigh: high, TP: tp, SL: sl,
+		Confidence: .76, Reason: "Dikenali oleh parser regex fallback; verifikasi manual disarankan",
+	}
 }
 
 func (api parserAPI) gemini(ctx context.Context, message string, prior *string) (signalClassification, error) {
