@@ -126,9 +126,10 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 			classification = parsed
 		}
 	}
-	classification = normalizeParserSignalType(classification)
-	classification = preferFarthestTelegramTarget(classification)
-	status, symbol, normalized, reason := validateParserClassification(classification, readParserSettings(ctx, api.pool))
+	classification = normalizeParserClassification(classification)
+	settings := readParserSettings(ctx, api.pool)
+	classification = preferFarthestTelegramTarget(classification, settings.entryMode)
+	status, symbol, normalized, reason := validateParserClassification(classification, settings)
 	if status == "IGNORED" {
 		return nil
 	}
@@ -208,8 +209,11 @@ func (api telegramAPI) saveTelegramSignal(ctx context.Context, message telegramc
 	return tx.Commit(ctx)
 }
 
-func preferFarthestTelegramTarget(value signalClassification) signalClassification {
+func preferFarthestTelegramTarget(value signalClassification, entryMode string) signalClassification {
 	if value.Type != "NEW_SIGNAL" || value.Action == nil || value.SL == nil || len(value.TP) < 2 || (*value.Action != "BUY" && *value.Action != "SELL") || !finite(*value.SL) || *value.SL <= 0 {
+		return value
+	}
+	if entryMode != "SINGLE" && telegramZoneTargetsMeetRiskReward(value) {
 		return value
 	}
 	farthest := value.TP[0]
@@ -281,4 +285,39 @@ func preferFarthestTelegramTarget(value signalClassification) signalClassificati
 		value.Reason = fmt.Sprintf("Target terjauh %g dipilih karena TP terdekat lebih pendek dari risiko SL", farthest)
 	}
 	return value
+}
+
+func telegramZoneTargetsMeetRiskReward(value signalClassification) bool {
+	if value.EntryLow == nil || value.EntryHigh == nil || value.SL == nil || len(value.TP) < 2 || value.Action == nil {
+		return false
+	}
+	low, high := *value.EntryLow, *value.EntryHigh
+	if low > high {
+		low, high = high, low
+	}
+	if low <= 0 || high <= low || !finite(low) || !finite(high) || !finite(*value.SL) {
+		return false
+	}
+	for index, target := range value.TP {
+		if !finite(target) || target <= 0 {
+			return false
+		}
+		fraction := float64(index) / float64(len(value.TP)-1)
+		entry := low + (high-low)*fraction
+		if *value.Action == "SELL" {
+			entry = high - (high-low)*fraction
+		}
+		if *value.Action == "BUY" {
+			if *value.SL >= entry || target <= entry || math.Abs(entry-*value.SL) > math.Abs(target-entry) {
+				return false
+			}
+		} else if *value.Action == "SELL" {
+			if *value.SL <= entry || target >= entry || math.Abs(entry-*value.SL) > math.Abs(target-entry) {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	return true
 }
