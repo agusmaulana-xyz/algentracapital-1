@@ -152,7 +152,8 @@ if (-not $sourceTerminalDir) {
 }
 if (-not $sourceTerminalDir) { throw 'MT5 tidak ditemukan dan terminal otomatis tidak berhasil dipasang.' }
 
-if ([string]::IsNullOrWhiteSpace($TerminalTemplateDir)) {
+$templateDirWasProvided = -not [string]::IsNullOrWhiteSpace($TerminalTemplateDir)
+if (-not $templateDirWasProvided) {
     $TerminalTemplateDir = Join-Path $resolvedRoot 'mt5\template\follower-clean'
 }
 $TerminalTemplateDir = [IO.Path]::GetFullPath($TerminalTemplateDir)
@@ -163,6 +164,35 @@ if ($TerminalTemplateDir.TrimEnd('\').Equals($sourceFullPath, [StringComparison]
     throw 'Template follower tidak boleh dibuat di dalam folder instalasi MT5 sumber.'
 }
 $templateParent = Split-Path -Parent $TerminalTemplateDir
+if (Test-Path -LiteralPath $TerminalTemplateDir) {
+    $isManagedTemplate = (Test-Path -LiteralPath $TerminalTemplateDir -PathType Container) -and
+        (Test-Path -LiteralPath (Join-Path $TerminalTemplateDir $templateMarker) -PathType Leaf)
+    if (-not $isManagedTemplate) {
+        if ($templateDirWasProvided) {
+            throw "Folder tujuan sudah ada dan bukan template yang dikelola skrip; pilih path kosong: $TerminalTemplateDir"
+        }
+
+        # Keep an existing default directory untouched. Repair can create a new managed
+        # sibling and persist that path in managed-worker.json for subsequent runs.
+        $baseName = Split-Path -Leaf $TerminalTemplateDir
+        $suffix = 'managed'
+        $index = 2
+        do {
+            $candidate = Join-Path $templateParent "$baseName-$suffix"
+            if (-not (Test-Path -LiteralPath $candidate)) { break }
+            if ((Test-Path -LiteralPath $candidate -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $candidate $templateMarker) -PathType Leaf)) {
+                break
+            }
+            $candidate = $null
+            $suffix = "managed-$index"
+            $index++
+        } while ($true)
+        $TerminalTemplateDir = $candidate
+        Write-Warning "Folder default '$baseName' sudah ada dan tidak dikelola skrip; isi dipertahankan. Template follower akan disiapkan pada: $TerminalTemplateDir"
+    }
+}
+
 if (-not (Test-Path -LiteralPath $TerminalTemplateDir -PathType Container)) {
     New-Item -ItemType Directory -Path $templateParent -Force | Out-Null
     $excluded = @(
