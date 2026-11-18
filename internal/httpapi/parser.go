@@ -25,18 +25,22 @@ type parserAPI struct {
 }
 
 type signalClassification struct {
-	IsSignal   bool      `json:"is_signal"`
-	Type       string    `json:"type"`
-	Action     *string   `json:"action"`
-	OrderType  *string   `json:"order_type"`
-	Symbol     *string   `json:"symbol"`
-	Entry      *float64  `json:"entry"`
-	EntryLow   *float64  `json:"entry_low"`
-	EntryHigh  *float64  `json:"entry_high"`
-	TP         []float64 `json:"tp"`
-	SL         *float64  `json:"sl"`
-	Confidence float64   `json:"confidence"`
-	Reason     string    `json:"reason"`
+	IsSignal        bool      `json:"is_signal"`
+	Type            string    `json:"type"`
+	Action          *string   `json:"action"`
+	OrderType       *string   `json:"order_type"`
+	Symbol          *string   `json:"symbol"`
+	Entry           *float64  `json:"entry"`
+	EntryLow        *float64  `json:"entry_low"`
+	EntryHigh       *float64  `json:"entry_high"`
+	TP              []float64 `json:"tp"`
+	SL              *float64  `json:"sl"`
+	RRMode          string    `json:"rr_mode,omitempty"`
+	RRFixedSLPoints float64   `json:"rr_fixed_sl_points,omitempty"`
+	RRFixedTPPoints float64   `json:"rr_fixed_tp_points,omitempty"`
+	RRTPMultiple    float64   `json:"rr_tp_sl_multiple,omitempty"`
+	Confidence      float64   `json:"confidence"`
+	Reason          string    `json:"reason"`
 }
 
 func (api parserAPI) register(mux *http.ServeMux) {
@@ -80,7 +84,10 @@ func (api parserAPI) test(w http.ResponseWriter, r *http.Request) {
 	}
 	classification = normalizeParserClassification(classification)
 	settings := readParserSettings(ctx, api.pool)
-	classification = preferFarthestTelegramTarget(classification, settings.entryMode)
+	classification = applyRiskRewardSettings(classification, settings)
+	if settings.rrMode == "" {
+		classification = preferFarthestTelegramTarget(classification, settings.entryMode)
+	}
 	status, symbol, normalized, reason := validateParserClassification(classification, settings)
 	writeJSON(w, 200, map[string]any{"classification": classification, "status": status, "symbol": symbol, "normalized_text": normalized, "validation_reason": reason})
 }
@@ -190,15 +197,19 @@ func extractParserEntryRange(message string) (float64, float64, bool) {
 }
 
 type parserSettings struct {
-	threshold    float64
-	allowUpdates bool
-	entryMode    string
-	mapping      map[string]string
+	threshold       float64
+	allowUpdates    bool
+	entryMode       string
+	rrMode          string
+	rrFixedSLPoints float64
+	rrFixedTPPoints float64
+	rrTPMultiple    float64
+	mapping         map[string]string
 }
 
 func readParserSettings(ctx context.Context, pool *dbstore.Pool) parserSettings {
-	s := parserSettings{threshold: .75, entryMode: "PARTIAL", mapping: map[string]string{"XAUUSD": "XAUUSD", "GOLD": "XAUUSD", "XAU": "XAUUSD", "EMAS": "XAUUSD"}}
-	rows, err := pool.Query(ctx, `SELECT key,value FROM settings WHERE key IN ('confidence_threshold','allow_updates','entry_mode','symbol_mapping')`)
+	s := parserSettings{threshold: .75, entryMode: "PARTIAL", rrMode: "TP_MAX", rrFixedSLPoints: 500, rrFixedTPPoints: 1000, rrTPMultiple: 2, mapping: map[string]string{"XAUUSD": "XAUUSD", "GOLD": "XAUUSD", "XAU": "XAUUSD", "EMAS": "XAUUSD"}}
+	rows, err := pool.Query(ctx, `SELECT key,value FROM settings WHERE key IN ('confidence_threshold','allow_updates','entry_mode','symbol_mapping','rr_mode','rr_fixed_sl_points','rr_fixed_tp_points','rr_tp_sl_multiple')`)
 	if err != nil {
 		return s
 	}
@@ -228,9 +239,43 @@ func readParserSettings(ctx context.Context, pool *dbstore.Pool) parserSettings 
 					s.mapping[strings.ToUpper(a)] = strings.ToUpper(b)
 				}
 			}
+		case "rr_mode":
+			var mode string
+			if json.Unmarshal([]byte(v), &mode) == nil && (mode == "TP_MAX" || mode == "FIXED_POINTS" || mode == "SL_MULTIPLE") {
+				s.rrMode = mode
+			}
+		case "rr_fixed_sl_points":
+			var points float64
+			if json.Unmarshal([]byte(v), &points) == nil && finite(points) && points >= 1 && points <= 10000000 && points == math.Trunc(points) {
+				s.rrFixedSLPoints = points
+			}
+		case "rr_fixed_tp_points":
+			var points float64
+			if json.Unmarshal([]byte(v), &points) == nil && finite(points) && points >= 1 && points <= 10000000 && points == math.Trunc(points) {
+				s.rrFixedTPPoints = points
+			}
+		case "rr_tp_sl_multiple":
+			var multiple float64
+			if json.Unmarshal([]byte(v), &multiple) == nil && finite(multiple) && multiple >= 1 && multiple <= 100 {
+				s.rrTPMultiple = multiple
+			}
 		}
 	}
 	return s
+}
+
+func applyRiskRewardSettings(c signalClassification, s parserSettings) signalClassification {
+	if s.rrMode == "" || !c.IsSignal || c.Type != "NEW_SIGNAL" {
+		return c
+	}
+	c.RRMode = s.rrMode
+	c.RRFixedSLPoints = s.rrFixedSLPoints
+	c.RRFixedTPPoints = s.rrFixedTPPoints
+	c.RRTPMultiple = s.rrTPMultiple
+	if s.rrMode == "TP_MAX" && len(c.TP) > 0 {
+		c.TP = []float64{c.TP[len(c.TP)-1]}
+	}
+	return c
 }
 
 var parserBuy = regexp.MustCompile(`(?i)\b(BUY|LONG|BELI)\b|شراء`)
@@ -463,40 +508,52 @@ func validateParserClassification(c signalClassification, s parserSettings) (str
 	if c.EntryLow != nil && c.EntryHigh != nil && c.Entry != nil {
 		return "REJECTED", nil, nil, "Gunakan entry tunggal atau zona entry, jangan keduanya"
 	}
-	prices := append([]float64{}, c.TP...)
-	for _, p := range []*float64{c.Entry, c.EntryLow, c.EntryHigh, c.SL} {
+	a := *c.Action
+	useSignalStops := s.rrMode != "FIXED_POINTS"
+	useSignalTargets := s.rrMode != "FIXED_POINTS" && s.rrMode != "SL_MULTIPLE"
+	prices := make([]float64, 0, len(c.TP)+4)
+	if useSignalTargets {
+		prices = append(prices, c.TP...)
+	}
+	for _, p := range []*float64{c.Entry, c.EntryLow, c.EntryHigh} {
 		if p != nil {
 			prices = append(prices, *p)
 		}
+	}
+	if useSignalStops && c.SL != nil {
+		prices = append(prices, *c.SL)
 	}
 	for _, p := range prices {
 		if p <= 0 || math.IsNaN(p) || math.IsInf(p, 0) {
 			return "REJECTED", nil, nil, "Harga harus lebih besar dari nol"
 		}
 	}
-	a := *c.Action
 	if c.EntryLow != nil && c.EntryHigh != nil {
 		lo, hi := *c.EntryLow, *c.EntryHigh
 		if lo > hi {
 			lo, hi = hi, lo
 		}
-		for _, tp := range c.TP {
-			if (a == "BUY" && tp <= hi) || (a == "SELL" && tp >= lo) {
-				return "REJECTED", nil, nil, "Target tidak valid untuk zona entry"
+		if useSignalTargets {
+			for _, tp := range c.TP {
+				if (a == "BUY" && tp <= hi) || (a == "SELL" && tp >= lo) {
+					return "REJECTED", nil, nil, "Target tidak valid untuk zona entry"
+				}
 			}
 		}
-		if c.SL != nil && ((a == "BUY" && *c.SL >= lo) || (a == "SELL" && *c.SL <= hi)) {
+		if useSignalStops && c.SL != nil && ((a == "BUY" && *c.SL >= lo) || (a == "SELL" && *c.SL <= hi)) {
 			return "REJECTED", nil, nil, "Stop loss tidak valid untuk zona entry"
 		}
 		c.EntryLow, c.EntryHigh = floatPtr(lo), floatPtr(hi)
 	}
 	if c.Entry != nil {
-		for _, tp := range c.TP {
-			if (a == "BUY" && tp <= *c.Entry) || (a == "SELL" && tp >= *c.Entry) {
-				return "REJECTED", nil, nil, "Target tidak valid untuk entry"
+		if useSignalTargets {
+			for _, tp := range c.TP {
+				if (a == "BUY" && tp <= *c.Entry) || (a == "SELL" && tp >= *c.Entry) {
+					return "REJECTED", nil, nil, "Target tidak valid untuk entry"
+				}
 			}
 		}
-		if c.SL != nil && ((a == "BUY" && *c.SL >= *c.Entry) || (a == "SELL" && *c.SL <= *c.Entry)) {
+		if useSignalStops && c.SL != nil && ((a == "BUY" && *c.SL >= *c.Entry) || (a == "SELL" && *c.SL <= *c.Entry)) {
 			return "REJECTED", nil, nil, "Stop loss tidak valid untuk entry"
 		}
 	}
@@ -508,7 +565,11 @@ func validateParserClassification(c signalClassification, s parserSettings) (str
 		return "REJECTED", &symbol, nil, "Nama simbol hasil pemetaan tidak valid"
 	}
 	riskRewardWarning := false
-	if c.SL != nil && len(c.TP) > 0 {
+	if s.rrMode == "FIXED_POINTS" {
+		riskRewardWarning = s.rrFixedSLPoints > s.rrFixedTPPoints
+	} else if s.rrMode == "SL_MULTIPLE" {
+		riskRewardWarning = s.rrTPMultiple < 1
+	} else if c.SL != nil && len(c.TP) > 0 {
 		var reference *float64
 		if a == "BUY" && c.EntryHigh != nil {
 			reference = c.EntryHigh
@@ -521,6 +582,10 @@ func validateParserClassification(c signalClassification, s parserSettings) (str
 			riskDistance := math.Abs(*reference - *c.SL)
 			rewardDistance := math.Inf(1)
 			for _, target := range c.TP {
+				if s.rrMode == "TP_MAX" {
+					rewardDistance = math.Abs(target - *reference)
+					break
+				}
 				rewardDistance = math.Min(rewardDistance, math.Abs(target-*reference))
 			}
 			if riskDistance > rewardDistance {
@@ -546,9 +611,21 @@ func validateParserClassification(c signalClassification, s parserSettings) (str
 	if c.SL != nil {
 		parts = append(parts, fmt.Sprintf("SL : %g", *c.SL))
 	}
+	switch s.rrMode {
+	case "FIXED_POINTS":
+		parts = append(parts, fmt.Sprintf("RR FIX : SL %g point | TP %g point (SL/TP sinyal diganti)", s.rrFixedSLPoints, s.rrFixedTPPoints))
+	case "SL_MULTIPLE":
+		parts = append(parts, fmt.Sprintf("RR : TP x%g jarak SL (TP sinyal diganti)", s.rrTPMultiple))
+	}
 	normalized := a + " : " + strings.Join(parts, " | ")
 	if riskRewardWarning {
-		return "PENDING", &symbol, &normalized, "Sinyal valid; risiko SL lebih besar dari TP terdekat. Pastikan lot sesuai risiko akun."
+		if s.rrMode == "FIXED_POINTS" {
+			return "PENDING", &symbol, &normalized, "Sinyal valid; jarak TP point lebih kecil dari jarak SL point. Periksa risiko akun."
+		}
+		if s.rrMode == "TP_MAX" {
+			return "PENDING", &symbol, &normalized, "Sinyal valid; risiko SL lebih besar dari jarak TP terakhir. Periksa risiko akun."
+		}
+		return "PENDING", &symbol, &normalized, "Sinyal valid; risiko SL lebih besar dari TP. Pastikan lot sesuai risiko akun."
 	}
 	return "PENDING", &symbol, &normalized, "Signal valid"
 }

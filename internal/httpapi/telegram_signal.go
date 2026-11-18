@@ -128,7 +128,10 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 	}
 	classification = normalizeParserClassification(classification)
 	settings := readParserSettings(ctx, api.pool)
-	classification = preferFarthestTelegramTarget(classification, settings.entryMode)
+	classification = applyRiskRewardSettings(classification, settings)
+	if settings.rrMode == "" {
+		classification = preferFarthestTelegramTarget(classification, settings.entryMode)
+	}
 	status, symbol, normalized, reason := validateParserClassification(classification, settings)
 	if status == "IGNORED" {
 		return nil

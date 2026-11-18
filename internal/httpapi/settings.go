@@ -85,6 +85,10 @@ func (api settingsAPI) read(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	values["entry_mode"] = defaultValue(values["entry_mode"], "PARTIAL")
+	values["rr_mode"] = defaultValue(values["rr_mode"], "TP_MAX")
+	values["rr_fixed_sl_points"] = defaultValue(values["rr_fixed_sl_points"], float64(500))
+	values["rr_fixed_tp_points"] = defaultValue(values["rr_fixed_tp_points"], float64(1000))
+	values["rr_tp_sl_multiple"] = defaultValue(values["rr_tp_sl_multiple"], float64(2))
 	values["registration_open"] = open
 	values["gemini_configured"] = api.geminiAPIKey != ""
 	values["gemini_model"] = api.currentGeminiModel()
@@ -179,13 +183,19 @@ func validateSetting(key string, value any) (any, error) {
 			return nil, errors.New("entry_mode harus SINGLE atau PARTIAL")
 		}
 		return mode, nil
+	case "rr_mode":
+		mode, ok := value.(string)
+		if !ok || mode != "TP_MAX" && mode != "FIXED_POINTS" && mode != "SL_MULTIPLE" {
+			return nil, errors.New("rr_mode harus TP_MAX, FIXED_POINTS, atau SL_MULTIPLE")
+		}
+		return mode, nil
 	case "allow_updates", "kill_switch", "registration_open":
 		boolean, ok := value.(bool)
 		if !ok {
 			return nil, fmt.Errorf("Setting '%s' harus boolean", key)
 		}
 		return boolean, nil
-	case "confidence_threshold", "max_market_deviation_pct":
+	case "confidence_threshold", "max_market_deviation_pct", "rr_fixed_sl_points", "rr_fixed_tp_points", "rr_tp_sl_multiple":
 		number, ok := value.(float64)
 		if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
 			return nil, fmt.Errorf("Setting '%s' harus angka valid", key)
@@ -193,6 +203,13 @@ func validateSetting(key string, value any) (any, error) {
 		lower, upper := 0.0, 1.0
 		if key == "max_market_deviation_pct" {
 			lower, upper = 0.1, 100.0
+		} else if key == "rr_fixed_sl_points" || key == "rr_fixed_tp_points" {
+			lower, upper = 1, 10000000
+			if number != math.Trunc(number) {
+				return nil, fmt.Errorf("Setting '%s' harus berupa bilangan bulat point", key)
+			}
+		} else if key == "rr_tp_sl_multiple" {
+			lower, upper = 1, 100
 		}
 		if number < lower || number > upper {
 			return nil, fmt.Errorf("Setting '%s' di luar rentang %v sampai %v", key, lower, upper)

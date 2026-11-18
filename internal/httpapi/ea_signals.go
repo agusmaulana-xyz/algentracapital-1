@@ -29,18 +29,22 @@ type eaSignalAPI struct {
 }
 
 type parsedSignal struct {
-	IsSignal   bool       `json:"is_signal"`
-	Type       string     `json:"type"`
-	Action     *string    `json:"action"`
-	OrderType  *string    `json:"order_type"`
-	Symbol     *string    `json:"symbol"`
-	Entry      *float64   `json:"entry"`
-	EntryLow   *float64   `json:"entry_low"`
-	EntryHigh  *float64   `json:"entry_high"`
-	TP         *[]float64 `json:"tp"`
-	SL         *float64   `json:"sl"`
-	Confidence float64    `json:"confidence"`
-	Reason     string     `json:"reason"`
+	IsSignal        bool       `json:"is_signal"`
+	Type            string     `json:"type"`
+	Action          *string    `json:"action"`
+	OrderType       *string    `json:"order_type"`
+	Symbol          *string    `json:"symbol"`
+	Entry           *float64   `json:"entry"`
+	EntryLow        *float64   `json:"entry_low"`
+	EntryHigh       *float64   `json:"entry_high"`
+	TP              *[]float64 `json:"tp"`
+	SL              *float64   `json:"sl"`
+	RRMode          string     `json:"rr_mode,omitempty"`
+	RRFixedSLPoints float64    `json:"rr_fixed_sl_points,omitempty"`
+	RRFixedTPPoints float64    `json:"rr_fixed_tp_points,omitempty"`
+	RRTPMultiple    float64    `json:"rr_tp_sl_multiple,omitempty"`
+	Confidence      float64    `json:"confidence"`
+	Reason          string     `json:"reason"`
 }
 
 type pendingSignalRow struct {
@@ -94,6 +98,7 @@ func (api eaSignalAPI) pending(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, responseControls)
 		return
 	}
+	rrSettings := readParserSettings(ctx, api.pool)
 	tx, err := api.pool.Begin(ctx)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Sinyal tidak tersedia")
@@ -180,16 +185,30 @@ func (api eaSignalAPI) pending(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		rrMode := parsed.RRMode
+		rrFixedSLPoints, rrFixedTPPoints, rrTPMultiple := parsed.RRFixedSLPoints, parsed.RRFixedTPPoints, parsed.RRTPMultiple
+		if rrMode == "" {
+			rrMode = rrSettings.rrMode
+			rrFixedSLPoints, rrFixedTPPoints, rrTPMultiple = rrSettings.rrFixedSLPoints, rrSettings.rrFixedTPPoints, rrSettings.rrTPMultiple
+		}
 		symbol := "XAUUSD"
 		if parsed.Symbol != nil && *parsed.Symbol != "" {
 			symbol = *parsed.Symbol
 		}
 		created := row.CreatedAt.UTC()
+		tpValues := targetValues(parsed.TP)
+		if rrMode == "TP_MAX" && len(tpValues) > 0 {
+			tpValues = []float64{tpValues[len(tpValues)-1]}
+		} else if rrMode == "FIXED_POINTS" || rrMode == "SL_MULTIPLE" {
+			tpValues = []float64{}
+		}
 		items = append(items, map[string]any{
 			"signal_id": row.ID, "group_id": nullableString(row.GroupID), "group_name": nullableString(row.GroupName),
 			"raw_text": row.RawText, "action": parsed.Action, "order_type": parsed.OrderType, "symbol": symbol,
 			"entry": parsed.Entry, "entry_low": parsed.EntryLow, "entry_high": parsed.EntryHigh,
-			"sl": parsed.SL, "tp": targetValues(parsed.TP), "entry_mode": mode, "confidence": parsed.Confidence,
+			"sl": parsed.SL, "tp": tpValues, "entry_mode": mode, "confidence": parsed.Confidence,
+			"rr_mode": rrMode, "rr_fixed_sl_points": rrFixedSLPoints,
+			"rr_fixed_tp_points": rrFixedTPPoints, "rr_tp_sl_multiple": rrTPMultiple,
 			"created_at": wibTime(created), "created_epoch": created.Unix(),
 		})
 	}
@@ -213,6 +232,18 @@ func validateParsedSignal(value parsedSignal) bool {
 		return false
 	}
 	if !finite(value.Confidence) || value.Confidence < 0 || value.Confidence > 1 || utf8.RuneCountInString(value.Reason) > 300 {
+		return false
+	}
+	if value.RRMode != "" && value.RRMode != "TP_MAX" && value.RRMode != "FIXED_POINTS" && value.RRMode != "SL_MULTIPLE" {
+		return false
+	}
+	if value.RRMode == "FIXED_POINTS" && (!finite(value.RRFixedSLPoints) || !finite(value.RRFixedTPPoints) ||
+		value.RRFixedSLPoints < 1 || value.RRFixedTPPoints < 1 ||
+		value.RRFixedSLPoints > 10000000 || value.RRFixedTPPoints > 10000000 ||
+		math.Trunc(value.RRFixedSLPoints) != value.RRFixedSLPoints || math.Trunc(value.RRFixedTPPoints) != value.RRFixedTPPoints) {
+		return false
+	}
+	if value.RRMode == "SL_MULTIPLE" && (!finite(value.RRTPMultiple) || value.RRTPMultiple < 1 || value.RRTPMultiple > 100) {
 		return false
 	}
 	for _, number := range []*float64{value.Entry, value.EntryLow, value.EntryHigh, value.SL} {

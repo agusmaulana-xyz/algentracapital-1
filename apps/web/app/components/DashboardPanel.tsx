@@ -175,6 +175,10 @@ export function DashboardPanel() {
   const [confidenceThreshold, setConfidenceThreshold] = useState("");
   const [maxMarketDeviation, setMaxMarketDeviation] = useState("");
   const [entryMode, setEntryMode] = useState("PARTIAL");
+  const [rrMode, setRrMode] = useState("TP_MAX");
+  const [rrFixedSLPoints, setRrFixedSLPoints] = useState("500");
+  const [rrFixedTPPoints, setRrFixedTPPoints] = useState("1000");
+  const [rrTPSLMultiple, setRrTPSLMultiple] = useState("2");
   const [symbolMapping, setSymbolMapping] = useState("");
   const [allowUpdates, setAllowUpdates] = useState(false);
   const [killSwitch, setKillSwitch] = useState(false);
@@ -262,6 +266,10 @@ export function DashboardPanel() {
     setConfidenceThreshold(String((data.confidence_threshold as number | undefined) ?? 0.75));
     setMaxMarketDeviation(String((data.max_market_deviation_pct as number | undefined) ?? 5));
     setEntryMode(String((data.entry_mode as string | undefined) ?? "PARTIAL"));
+    setRrMode(String((data.rr_mode as string | undefined) ?? "TP_MAX"));
+    setRrFixedSLPoints(String((data.rr_fixed_sl_points as number | undefined) ?? 500));
+    setRrFixedTPPoints(String((data.rr_fixed_tp_points as number | undefined) ?? 1000));
+    setRrTPSLMultiple(String((data.rr_tp_sl_multiple as number | undefined) ?? 2));
     const mapping = data.symbol_mapping as Record<string, string> | undefined;
     setSymbolMapping(JSON.stringify(mapping ?? { GOLD: "XAUUSD", XAU: "XAUUSD", EMAS: "XAUUSD" }, null, 2));
     setAllowUpdates((data.allow_updates as boolean | undefined) ?? false);
@@ -563,6 +571,10 @@ export function DashboardPanel() {
         symbol_mapping: JSON.parse(symbolMapping || "{}"),
         max_market_deviation_pct: Number(maxMarketDeviation),
         entry_mode: entryMode,
+        rr_mode: rrMode,
+        rr_fixed_sl_points: Number(rrFixedSLPoints),
+        rr_fixed_tp_points: Number(rrFixedTPPoints),
+        rr_tp_sl_multiple: Number(rrTPSLMultiple),
         allow_updates: allowUpdates,
         kill_switch: killSwitch,
       };
@@ -1377,6 +1389,63 @@ export function DashboardPanel() {
                   <option value="SINGLE">Single entry</option>
                 </select>
               </label>
+              <label>
+                Metode Risk/Reward
+                <small className="field-help">Menentukan target yang dipakai dan bagaimana jarak SL/TP dihitung saat EA mengeksekusi sinyal.</small>
+                <select id="rr-mode" value={rrMode} onChange={(event) => setRrMode(event.target.value)}>
+                  <option value="TP_MAX">TP maksimal (TP terakhir)</option>
+                  <option value="FIXED_POINTS">SL/TP manual (point)</option>
+                  <option value="SL_MULTIPLE">TP kelipatan jarak SL</option>
+                </select>
+                <small className="field-help">
+                  {rrMode === "TP_MAX"
+                    ? "Sinyal dengan banyak TP hanya memakai TP terakhir sebagai target."
+                    : rrMode === "FIXED_POINTS"
+                      ? "SL/TP pada sinyal diganti dengan jarak point yang diatur di bawah."
+                      : "TP sinyal diganti; SL sinyal (atau SL default EA) menjadi dasar pengali."}
+                </small>
+              </label>
+              {rrMode === "FIXED_POINTS" && (
+                <>
+                  <label>
+                    SL manual (point)
+                    <small className="field-help">Jarak dari harga entry; dihitung memakai point instrumen pada broker MT5.</small>
+                    <input
+                      type="number"
+                      id="rr-fixed-sl-points"
+                      min="1"
+                      max="10000000"
+                      step="1"
+                      value={rrFixedSLPoints}
+                      onChange={(event) => setRrFixedSLPoints(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    TP manual (point)
+                    <small className="field-help">Jarak TP dari entry dalam point instrumen yang sama.</small>
+                    <input
+                      type="number"
+                      id="rr-fixed-tp-points"
+                      min="1"
+                      max="10000000"
+                      step="1"
+                      value={rrFixedTPPoints}
+                      onChange={(event) => setRrFixedTPPoints(event.target.value)}
+                    />
+                  </label>
+                </>
+              )}
+              {rrMode === "SL_MULTIPLE" && (
+                <label>
+                  Kelipatan TP terhadap SL
+                  <small className="field-help">Contoh: jarak SL 100 point atau pip dan x3 menghasilkan jarak TP tiga kali jarak SL.</small>
+                  <select id="rr-tp-sl-multiple" value={rrTPSLMultiple} onChange={(event) => setRrTPSLMultiple(event.target.value)}>
+                    {[1, 2, 3, 4, 5, 10].map((multiple) => (
+                      <option key={multiple} value={multiple}>{`x${multiple}`}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <label className="span-2">
                 Symbol mapping (JSON)
                 <small className="field-help">

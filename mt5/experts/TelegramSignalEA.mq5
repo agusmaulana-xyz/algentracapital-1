@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.102"
+#property version   "1.103"
 #property description "Executes Telegram signals, reports master MT5 balance, and publishes all open positions"
 
 #define MAX_SIGNAL_TARGETS 20
@@ -853,10 +853,61 @@ bool CheckRewardRisk(const string symbol, const double reference, const double s
    return MathAbs(reference - sl) <= MathAbs(tp - reference) + tick * 0.5;
   }
 
+bool ApplyRiskReward(const string symbol, const string action, const double reference,
+                     const string rr_mode, const double fixed_sl_points,
+                     const double fixed_tp_points, const double tp_sl_multiple,
+                     double &sl, double &tp, string &reason)
+  {
+   if(rr_mode == "" || rr_mode == "TP_MAX")
+      return true;
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0)
+     {
+      reason = "Nilai SYMBOL_POINT tidak tersedia untuk instrumen broker";
+      return false;
+     }
+
+   if(rr_mode == "FIXED_POINTS")
+     {
+      if(fixed_sl_points < 1.0 || fixed_tp_points < 1.0)
+        {
+         reason = "Pengaturan SL/TP manual dalam point tidak valid";
+         return false;
+        }
+      sl = action == "BUY" ? reference - fixed_sl_points * point : reference + fixed_sl_points * point;
+      tp = action == "BUY" ? reference + fixed_tp_points * point : reference - fixed_tp_points * point;
+      return true;
+     }
+
+   if(rr_mode == "SL_MULTIPLE")
+     {
+      if(sl <= 0.0 || tp_sl_multiple < 1.0 || tp_sl_multiple > 100.0)
+        {
+         reason = "Mode TP kelipatan membutuhkan SL dan pengali minimal x1";
+         return false;
+        }
+      double risk_distance = MathAbs(reference - sl);
+      if(risk_distance <= 0.0)
+        {
+         reason = "Jarak SL dari entry harus lebih besar dari nol";
+         return false;
+        }
+      double reward_distance = risk_distance * tp_sl_multiple;
+      tp = action == "BUY" ? reference + reward_distance : reference - reward_distance;
+      return true;
+     }
+
+   reason = "Mode Risk/Reward tidak dikenal";
+   return false;
+  }
+
 bool ValidateSignalPlan(const string symbol, const string action, const string requested_type,
                         const bool zone_order, const double requested_entry,
                         const double entry_low, const double entry_high, const double sl_input,
                         const string tp_array, const int tp_count, const int order_count,
+                        const string rr_mode, const double fixed_sl_points,
+                        const double fixed_tp_points, const double tp_sl_multiple,
                         const double bid, const double ask, string &reason)
   {
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
@@ -901,6 +952,9 @@ bool ValidateSignalPlan(const string symbol, const string action, const string r
          sl = action == "BUY" ? reference - DefaultSLPoints * point : reference + DefaultSLPoints * point;
       if(UseDefaultSLTP && tp <= 0.0 && DefaultTPPoints > 0 && point > 0.0)
          tp = action == "BUY" ? reference + DefaultTPPoints * point : reference - DefaultTPPoints * point;
+      if(!ApplyRiskReward(symbol, action, reference, rr_mode, fixed_sl_points,
+                          fixed_tp_points, tp_sl_multiple, sl, tp, reason))
+         return false;
       sl = NormalizePrice(symbol, sl);
       tp = NormalizePrice(symbol, tp);
       if(!CheckPriceLevels(symbol, action, reference, sl, tp))
@@ -908,7 +962,7 @@ bool ValidateSignalPlan(const string symbol, const string action, const string r
          reason = "SL/TP invalid or inside broker stops level";
          return false;
         }
-      if(!CheckRewardRisk(symbol, reference, sl, tp))
+      if(rr_mode != "FIXED_POINTS" && !CheckRewardRisk(symbol, reference, sl, tp))
         {
          reason = "Jarak SL lebih besar daripada jarak TP";
          return false;
@@ -1004,6 +1058,8 @@ bool ResolveOpposingExposure(const long signal_id, const string symbol, const st
 bool ProcessOrderLeg(const long signal_id, const string symbol, const string action,
                      const string requested_type, const bool zone_order, const double requested_entry,
                      const double sl_input, const double tp_input, const int leg, const double risk_money,
+                     const string rr_mode, const double fixed_sl_points,
+                     const double fixed_tp_points, const double tp_sl_multiple,
                      const double bid, const double ask)
   {
    int saved_state = SavedState(signal_id, leg);
@@ -1062,6 +1118,13 @@ bool ProcessOrderLeg(const long signal_id, const string symbol, const string act
       if(tp <= 0.0 && DefaultTPPoints > 0)
          tp = action == "BUY" ? reference + DefaultTPPoints * point : reference - DefaultTPPoints * point;
      }
+   string rr_error = "";
+   if(!ApplyRiskReward(symbol, action, reference, rr_mode, fixed_sl_points,
+                       fixed_tp_points, tp_sl_multiple, sl, tp, rr_error))
+     {
+      ReportLegOutcome(signal_id, symbol, action, leg, "REJECTED", 0.0, rr_error);
+      return false;
+     }
    sl = NormalizePrice(symbol, sl);
    tp = NormalizePrice(symbol, tp);
    if(!CheckPriceLevels(symbol, action, reference, sl, tp))
@@ -1069,7 +1132,7 @@ bool ProcessOrderLeg(const long signal_id, const string symbol, const string act
       ReportLegOutcome(signal_id, symbol, action, leg, "REJECTED", 0.0, "SL/TP invalid or inside broker stops level");
       return false;
      }
-   if(!CheckRewardRisk(symbol, reference, sl, tp))
+   if(rr_mode != "FIXED_POINTS" && !CheckRewardRisk(symbol, reference, sl, tp))
      {
       ReportLegOutcome(signal_id, symbol, action, leg, "REJECTED", 0.0, "Jarak SL lebih besar daripada jarak TP");
       return false;
@@ -1195,6 +1258,10 @@ void ProcessSignal(const string item)
    double sl = JsonNumber(item, "sl");
    string tp_array = JsonValue(item, "tp");
    int tp_count = ArrayNumberCount(tp_array);
+   string rr_mode = JsonValue(item, "rr_mode");
+   double rr_fixed_sl_points = JsonNumber(item, "rr_fixed_sl_points");
+   double rr_fixed_tp_points = JsonNumber(item, "rr_fixed_tp_points");
+   double rr_tp_sl_multiple = JsonNumber(item, "rr_tp_sl_multiple");
    int order_count = tp_count > 0 ? tp_count : (zone_order ? 2 : 1);
    if(JsonValue(item, "entry_mode") == "SINGLE")
       order_count = 1;
@@ -1203,6 +1270,7 @@ void ProcessSignal(const string item)
    if(bid > 0.0 && ask > 0.0 &&
       !ValidateSignalPlan(symbol, action, order_type, zone_order, requested_entry,
                           entry_low, entry_high, sl, tp_array, tp_count, order_count,
+                          rr_mode, rr_fixed_sl_points, rr_fixed_tp_points, rr_tp_sl_multiple,
                           bid, ask, plan_error))
      {
       RejectSignal(signal_id, symbol, action, plan_error, order_count);
@@ -1255,11 +1323,13 @@ void ProcessSignal(const string item)
          else
             leg_entry = entry_high - (entry_high - entry_low) * (double)i / (order_count - 1);
          leg_entry = NormalizePriceInRange(symbol, leg_entry, entry_low, entry_high);
-         ProcessOrderLeg(signal_id, symbol, action, "AUTO", true, leg_entry, sl, tp, leg, risk_money_per_leg, bid, ask);
+         ProcessOrderLeg(signal_id, symbol, action, "AUTO", true, leg_entry, sl, tp, leg, risk_money_per_leg,
+                         rr_mode, rr_fixed_sl_points, rr_fixed_tp_points, rr_tp_sl_multiple, bid, ask);
         }
       else
          ProcessOrderLeg(signal_id, symbol, action, order_type, false, JsonNumber(item, "entry"), sl, tp,
-                         leg, risk_money_per_leg, bid, ask);
+                         leg, risk_money_per_leg, rr_mode, rr_fixed_sl_points, rr_fixed_tp_points,
+                         rr_tp_sl_multiple, bid, ask);
      }
    g_signal_count++;
   }
@@ -1279,7 +1349,7 @@ void SendHeartbeat()
   {
    string symbol = JsonEscape(_Symbol);
    string body = StringFormat(
-      "{\"active\":true,\"terminal\":\"%s\",\"version\":\"1.102\",\"symbol\":\"%s\"}",
+      "{\"active\":true,\"terminal\":\"%s\",\"version\":\"1.103\",\"symbol\":\"%s\"}",
       JsonEscape(TerminalInfoString(TERMINAL_NAME)), symbol);
    string response;
    HttpRequest("POST", "/api/ea/heartbeat", body, response);
@@ -1365,7 +1435,7 @@ void UpdatePanel()
   {
    int closed = g_wins + g_losses;
    double winrate = closed > 0 ? (double)g_wins / closed * 100.0 : 0.0;
-    Comment("TelegramSignalEA 1.102\n",
+    Comment("TelegramSignalEA 1.103\n",
            "Backend: ", g_connection_status, "\n",
            "Mode: LIVE\n",
            "Signals this session: ", g_signal_count, "\n",

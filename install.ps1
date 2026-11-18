@@ -487,7 +487,7 @@ if($Repair){
   Ensure-CopierBinaries -Rebuild
   Build-WebPackage
   $expertSource=Join-Path $Source 'mt5\experts';$expertInstall=Join-Path $InstallDir 'mt5\experts'
-  foreach($relative in @('MT5FollowerCopyEA.mq5','Algentra\MT5LoginProbe.mq5')){
+  foreach($relative in @('MT5FollowerCopyEA.mq5','Algentra\MT5LoginProbe.mq5','TelegramSignalEA.mq5')){
     $sourceFile=Join-Path $expertSource $relative
     if(-not(Test-Path -LiteralPath $sourceFile -PathType Leaf)){throw "Source EA MT5 tidak ditemukan: $sourceFile"}
     $destinationFile=Join-Path $expertInstall $relative
